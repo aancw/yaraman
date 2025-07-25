@@ -73,6 +73,23 @@
                         </a>
                     </li>
                 </ul>
+                <ul class="navbar-nav">
+                    <li class="nav-item" id="auth-section">
+                        <button class="btn btn-outline-primary btn-sm" id="login-btn" onclick="showLoginModal()">
+                            <i class="fas fa-sign-in-alt me-1"></i>Admin Login
+                        </button>
+                        <div class="dropdown" id="admin-dropdown" style="display: none;">
+                            <button class="btn btn-success btn-sm dropdown-toggle" type="button" data-bs-toggle="dropdown">
+                                <i class="fas fa-user-shield me-1"></i>Admin
+                            </button>
+                            <ul class="dropdown-menu dropdown-menu-end">
+                                <li><button class="dropdown-item" onclick="logout()">
+                                    <i class="fas fa-sign-out-alt me-1"></i>Logout
+                                </button></li>
+                            </ul>
+                        </div>
+                    </li>
+                </ul>
             </div>
         </div>
     </nav>
@@ -169,7 +186,7 @@
                                 <h2 class="fw-bold mb-2">YARA Rules Management</h2>
                                 <p class="text-muted">Manage and upload YARA rules for malware detection and analysis</p>
                             </div>
-                            <button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#uploadModal">
+                            <button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#uploadModal" id="upload-rules-btn">
                                 <i class="fas fa-upload me-2"></i>Upload Rules
                             </button>
                         </div>
@@ -252,6 +269,50 @@
                                     </table>
                                 </div>
                             </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Admin Login Modal -->
+    <div class="modal fade" id="loginModal" tabindex="-1" aria-labelledby="loginModalLabel" aria-hidden="true">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="loginModalLabel">
+                        <i class="fas fa-sign-in-alt text-primary me-2"></i>
+                        Admin Login
+                    </h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body">
+                    <form id="login-form">
+                        <div class="mb-3">
+                            <label for="admin-username" class="form-label">
+                                <i class="fas fa-user me-1"></i>Username
+                            </label>
+                            <input type="text" class="form-control" id="admin-username" name="username" required>
+                        </div>
+                        <div class="mb-3">
+                            <label for="admin-password" class="form-label">
+                                <i class="fas fa-lock me-1"></i>Password
+                            </label>
+                            <input type="password" class="form-control" id="admin-password" name="password" required>
+                        </div>
+                        <div class="d-grid">
+                            <button type="submit" class="btn btn-primary">
+                                <i class="fas fa-sign-in-alt me-2"></i>Login
+                            </button>
+                        </div>
+                    </form>
+                    
+                    <!-- Login Error -->
+                    <div id="login-error" class="mt-3" style="display: none;">
+                        <div class="alert alert-danger">
+                            <i class="fas fa-exclamation-triangle me-2"></i>
+                            <span id="login-error-message">Invalid credentials</span>
                         </div>
                     </div>
                 </div>
@@ -370,6 +431,28 @@
         let currentPage = 'scanner';
         
         function showPage(page) {
+            // Check admin access for rules page server-side
+            if (page === 'rules') {
+                fetch('/api/ui/admin-features')
+                    .then(response => response.json())
+                    .then(data => {
+                        if (!data.can_access_rules_page) {
+                            showLoginModal();
+                            return;
+                        }
+                        // Show rules page if authorized
+                        switchToPage(page);
+                    })
+                    .catch(error => {
+                        console.error('Error checking access:', error);
+                        showLoginModal();
+                    });
+            } else {
+                switchToPage(page);
+            }
+        }
+        
+        function switchToPage(page) {
             // Hide all pages
             document.getElementById('scanner-page').style.display = 'none';
             document.getElementById('rules-page').style.display = 'none';
@@ -406,6 +489,7 @@
             });
             
             // Initial page load
+            updateUIBasedOnAuth();
             handleRouting();
         });
         
@@ -433,6 +517,98 @@
                 handleRouting();
             }
         });
+
+        // Authentication Functions
+        function updateUIBasedOnAuth() {
+            fetch('/api/ui/admin-features')
+                .then(response => response.json())
+                .then(data => {
+                    updateAuthUI(data);
+                })
+                .catch(error => {
+                    console.error('Error checking auth status:', error);
+                    updateAuthUI({
+                        show_upload_button: false,
+                        show_delete_buttons: false,
+                        show_admin_dropdown: false,
+                        show_login_button: true,
+                        can_access_rules_page: false
+                    });
+                });
+        }
+
+        function updateAuthUI(features) {
+            const loginBtn = document.getElementById('login-btn');
+            const adminDropdown = document.getElementById('admin-dropdown');
+            const uploadBtn = document.getElementById('upload-rules-btn');
+            
+            if (features.show_login_button) {
+                loginBtn.style.display = 'block';
+            } else {
+                loginBtn.style.display = 'none';
+            }
+            
+            if (features.show_admin_dropdown) {
+                adminDropdown.style.display = 'block';
+            } else {
+                adminDropdown.style.display = 'none';
+            }
+            
+            if (uploadBtn) {
+                if (features.show_upload_button) {
+                    uploadBtn.style.display = 'block';
+                } else {
+                    uploadBtn.style.display = 'none';
+                }
+            }
+            
+            // Store features for use in displayRules
+            window.adminFeatures = features;
+        }
+
+        function showLoginModal() {
+            const modal = new bootstrap.Modal(document.getElementById('loginModal'));
+            document.getElementById('login-error').style.display = 'none';
+            document.getElementById('login-form').reset();
+            modal.show();
+        }
+
+        function login(username, password) {
+            return fetch('/api/auth/login', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ username, password })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.error) {
+                    throw new Error(data.error);
+                }
+                // Update UI based on server response
+                updateUIBasedOnAuth();
+                return data;
+            });
+        }
+
+        function logout() {
+            fetch('/api/auth/logout', { method: 'POST' })
+                .then(response => response.json())
+                .then(data => {
+                    // Update UI based on server response
+                    updateUIBasedOnAuth();
+                    
+                    // Redirect to scanner if on rules page
+                    if (currentPage === 'rules') {
+                        updateURL('scanner');
+                        switchToPage('scanner');
+                    }
+                })
+                .catch(error => {
+                    console.error('Error logging out:', error);
+                });
+        }
 
         // YARA Rules Management Functions
         function loadRules() {
@@ -492,9 +668,11 @@
                             <button type="button" class="btn btn-outline-primary" onclick="viewRule('${escapeHtml(rule.filename)}')" title="View Rule">
                                 <i class="fas fa-eye"></i>
                             </button>
+                            ${(window.adminFeatures && window.adminFeatures.show_delete_buttons) ? `
                             <button type="button" class="btn btn-outline-danger" onclick="deleteRule('${escapeHtml(rule.filename)}')" title="Delete Rule">
                                 <i class="fas fa-trash"></i>
                             </button>
+                            ` : ''}
                         </div>
                     </td>
                 </tr>
@@ -576,7 +754,14 @@
             fetch(`/api/yara/rules/${encodeURIComponent(filename)}`, {
                 method: 'DELETE'
             })
-            .then(response => response.json())
+            .then(response => {
+                if (response.status === 401) {
+                    updateUIBasedOnAuth();
+                    showLoginModal();
+                    return Promise.reject(new Error('Authentication required'));
+                }
+                return response.json();
+            })
             .then(data => {
                 if (data.error) {
                     showError('Failed to delete rule: ' + data.error);
@@ -587,10 +772,39 @@
                 loadRules();
             })
             .catch(error => {
+                if (error.message === 'Authentication required') {
+                    return;
+                }
                 console.error('Error deleting rule:', error);
                 showError('Failed to delete rule');
             });
         }
+
+        // Login form handling
+        document.addEventListener('DOMContentLoaded', function() {
+            document.getElementById('login-form').addEventListener('submit', function(e) {
+                e.preventDefault();
+                
+                const username = document.getElementById('admin-username').value;
+                const password = document.getElementById('admin-password').value;
+                
+                login(username, password)
+                    .then(data => {
+                        bootstrap.Modal.getInstance(document.getElementById('loginModal')).hide();
+                        showSuccess('Login successful');
+                        
+                        // If user was trying to access rules page, redirect there
+                        if (currentPage !== 'rules') {
+                            updateURL('rules');
+                            switchToPage('rules');
+                        }
+                    })
+                    .catch(error => {
+                        document.getElementById('login-error-message').textContent = error.message;
+                        document.getElementById('login-error').style.display = 'block';
+                    });
+            });
+        });
 
         // Upload form handling
         document.addEventListener('DOMContentLoaded', function() {
@@ -616,7 +830,15 @@
                     method: 'POST',
                     body: formData
                 })
-                .then(response => response.json())
+                .then(response => {
+                    if (response.status === 401) {
+                        updateUIBasedOnAuth();
+                        showLoginModal();
+                        bootstrap.Modal.getInstance(document.getElementById('uploadModal')).hide();
+                        return Promise.reject(new Error('Authentication required'));
+                    }
+                    return response.json();
+                })
                 .then(data => {
                     updateProgress(100);
                     
@@ -634,6 +856,9 @@
                     }, 2000);
                 })
                 .catch(error => {
+                    if (error.message === 'Authentication required') {
+                        return;
+                    }
                     console.error('Upload error:', error);
                     showUploadError('Upload failed: ' + error.message);
                 });

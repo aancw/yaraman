@@ -55,13 +55,19 @@ def main():
     
     # Start the application
     print("\n🚀 Starting YaraMan server...")
-    print("📍 Open your browser to: http://localhost:5002")
+    try:
+        from app import app
+        host = app.config['HOST']
+        port = app.config['PORT']
+        print(f"📍 Open your browser to: http://{host}:{port}")
+    except:
+        print("📍 Open your browser to: http://localhost:5002")
     print("🔧 Press Ctrl+C to stop the server")
     print("=" * 60)
     
     try:
         from app import app
-        app.run(debug=False, host='0.0.0.0', port=5002)
+        app.run(debug=app.config['DEBUG'], host=app.config['HOST'], port=app.config['PORT'])
     except KeyboardInterrupt:
         print("\n👋 YaraMan server stopped")
     except Exception as e:

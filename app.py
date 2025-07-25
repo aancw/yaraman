@@ -5,19 +5,202 @@ YaraMan - YARA Rules Manager & File Scanner
 A standalone Flask application for managing YARA rules and scanning files.
 """
 
-from flask import Flask, render_template, request, jsonify, send_from_directory
+from flask import Flask, render_template, request, jsonify, send_from_directory, session
 import os
 import json
 import zipfile
 import yara
 import hashlib
+import sqlite3
 from datetime import datetime
 from werkzeug.utils import secure_filename
+from werkzeug.security import generate_password_hash, check_password_hash
+from functools import wraps
+import configparser
+
+def load_config(config_file='app.conf'):
+    """Load configuration from app.conf file with environment variable override"""
+    config = configparser.ConfigParser()
+    
+    # Set default values
+    defaults = {
+        'application': {
+            'debug': 'false',
+            'host': '0.0.0.0',
+            'port': '5002',
+            'secret_key': 'yaraman-default-secret-key-change-in-production'
+        },
+        'directories': {
+            'yara_rules_folder': 'yara_rules',
+            'upload_folder': 'uploads'
+        },
+        'limits': {
+            'max_content_length': '104857600',
+            'max_string_instances': '5',
+            'max_strings_per_match': '10',
+            'max_match_data_length': '100'
+        },
+        'authentication': {
+            'admin_username': 'admin',
+            'admin_password': 'admin123'
+        },
+        'security': {
+            'enable_cors': 'false',
+            'allowed_origins': '',
+            'file_extensions_yara': '.yar,.yara',
+            'file_extensions_upload': ''
+        },
+        'logging': {
+            'log_level': 'INFO',
+            'log_file': '',
+            'console_logging': 'true'
+        },
+        'scanning': {
+            'compile_timeout': '30',
+            'scan_timeout': '60',
+            'chunk_size': '4096'
+        }
+    }
+    
+    # Load defaults first
+    config.read_dict(defaults)
+    
+    # Load from config file if it exists
+    if os.path.exists(config_file):
+        config.read(config_file)
+    
+    # Environment variable overrides
+    env_mappings = {
+        'SECRET_KEY': ('application', 'secret_key'),
+        'ADMIN_USERNAME': ('authentication', 'admin_username'),
+        'ADMIN_PASSWORD': ('authentication', 'admin_password'),
+        'YARA_RULES_FOLDER': ('directories', 'yara_rules_folder'),
+        'UPLOAD_FOLDER': ('directories', 'upload_folder'),
+        'DEBUG': ('application', 'debug'),
+        'HOST': ('application', 'host'),
+        'PORT': ('application', 'port')
+    }
+    
+    for env_var, (section, key) in env_mappings.items():
+        value = os.environ.get(env_var)
+        if value:
+            config.set(section, key, value)
+    
+    return config
+
+# Load configuration
+config = load_config()
 
 app = Flask(__name__)
-app.config['YARA_RULES_FOLDER'] = 'yara_rules'
-app.config['UPLOAD_FOLDER'] = 'uploads'
-app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB max file size
+app.config['YARA_RULES_FOLDER'] = config.get('directories', 'yara_rules_folder')
+app.config['UPLOAD_FOLDER'] = config.get('directories', 'upload_folder')
+app.config['MAX_CONTENT_LENGTH'] = config.getint('limits', 'max_content_length')
+app.config['SECRET_KEY'] = config.get('application', 'secret_key')
+app.config['ADMIN_USERNAME'] = config.get('authentication', 'admin_username')
+app.config['ADMIN_PASSWORD'] = config.get('authentication', 'admin_password')
+app.config['DEBUG'] = config.getboolean('application', 'debug')
+app.config['HOST'] = config.get('application', 'host')
+app.config['PORT'] = config.getint('application', 'port')
+
+# Additional config for scanning limits
+app.config['MAX_STRING_INSTANCES'] = config.getint('limits', 'max_string_instances')
+app.config['MAX_STRINGS_PER_MATCH'] = config.getint('limits', 'max_strings_per_match')
+app.config['MAX_MATCH_DATA_LENGTH'] = config.getint('limits', 'max_match_data_length')
+app.config['CHUNK_SIZE'] = config.getint('scanning', 'chunk_size')
+
+def init_database():
+    """Initialize SQLite database for user management"""
+    db_path = 'yaraman.db'
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    
+    # Create users table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'admin',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_login TIMESTAMP
+        )
+    ''')
+    
+    # Create default admin user if none exists
+    cursor.execute('SELECT COUNT(*) FROM users WHERE role = "admin"')
+    admin_count = cursor.fetchone()[0]
+    
+    if admin_count == 0:
+        admin_username = app.config['ADMIN_USERNAME']
+        admin_password = app.config['ADMIN_PASSWORD']
+        password_hash = generate_password_hash(admin_password)
+        
+        cursor.execute('''
+            INSERT INTO users (username, password_hash, role)
+            VALUES (?, ?, ?)
+        ''', (admin_username, password_hash, 'admin'))
+        
+        print(f"Created default admin user: {admin_username}")
+    
+    conn.commit()
+    conn.close()
+
+def authenticate_user(username, password):
+    """Authenticate user against database"""
+    conn = sqlite3.connect('yaraman.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        SELECT id, username, password_hash, role
+        FROM users 
+        WHERE username = ? AND role = 'admin'
+    ''', (username,))
+    
+    user = cursor.fetchone()
+    conn.close()
+    
+    if user and check_password_hash(user[2], password):
+        return {
+            'id': user[0],
+            'username': user[1],
+            'role': user[3]
+        }
+    return None
+
+def update_last_login(user_id):
+    """Update user's last login timestamp"""
+    conn = sqlite3.connect('yaraman.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        UPDATE users 
+        SET last_login = CURRENT_TIMESTAMP
+        WHERE id = ?
+    ''', (user_id,))
+    
+    conn.commit()
+    conn.close()
+
+def admin_required(f):
+    """Decorator to require admin authentication for YARA management endpoints"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not session.get('admin_logged_in') or not session.get('user_id'):
+            return jsonify({'error': 'Admin authentication required'}), 401
+        
+        # Verify user still exists in database
+        conn = sqlite3.connect('yaraman.db')
+        cursor = conn.cursor()
+        cursor.execute('SELECT role FROM users WHERE id = ?', (session.get('user_id'),))
+        user = cursor.fetchone()
+        conn.close()
+        
+        if not user or user[0] != 'admin':
+            session.clear()
+            return jsonify({'error': 'Admin authentication required'}), 401
+            
+        return f(*args, **kwargs)
+    return decorated_function
 
 def validate_yara_rule(rule_content):
     """Validate YARA rule syntax"""
@@ -37,8 +220,9 @@ def get_yara_rules():
     if not os.path.exists(yara_folder):
         return rules
     
+    allowed_extensions = tuple(ext.strip() for ext in config.get('security', 'file_extensions_yara').split(','))
     for filename in os.listdir(yara_folder):
-        if filename.endswith(('.yar', '.yara')):
+        if filename.endswith(allowed_extensions):
             filepath = os.path.join(yara_folder, filename)
             try:
                 stat = os.stat(filepath)
@@ -88,8 +272,9 @@ def compile_yara_rules():
     rule_count = 0
     compilation_errors = []
     
+    allowed_extensions = tuple(ext.strip() for ext in config.get('security', 'file_extensions_yara').split(','))
     for filename in os.listdir(yara_folder):
-        if filename.endswith(('.yar', '.yara')):
+        if filename.endswith(allowed_extensions):
             filepath = os.path.join(yara_folder, filename)
             try:
                 with open(filepath, 'r', encoding='utf-8') as f:
@@ -165,10 +350,10 @@ def scan_file_with_yara(file_path):
                             {
                                 'offset': instance.offset,
                                 'matched_length': len(instance.matched_data),
-                                'match_data': instance.matched_data.decode('utf-8', errors='replace')[:100]
-                            } for instance in s.instances[:5]  # Limit to first 5 instances
+                                'match_data': instance.matched_data.decode('utf-8', errors='replace')[:app.config['MAX_MATCH_DATA_LENGTH']]
+                            } for instance in s.instances[:app.config['MAX_STRING_INSTANCES']]
                         ]
-                    } for s in match.strings[:10]  # Limit to first 10 strings
+                    } for s in match.strings[:app.config['MAX_STRINGS_PER_MATCH']]
                 ]
             })
         
@@ -193,7 +378,8 @@ def get_file_hash(file_path, hash_type='sha256'):
     hash_func = hashlib.new(hash_type)
     try:
         with open(file_path, 'rb') as f:
-            for chunk in iter(lambda: f.read(4096), b""):
+            chunk_size = app.config['CHUNK_SIZE']
+            for chunk in iter(lambda: f.read(chunk_size), b""):
                 hash_func.update(chunk)
         return hash_func.hexdigest()
     except Exception:
@@ -204,10 +390,93 @@ def index():
     """Main page"""
     return send_from_directory('.', 'index.html')
 
+@app.route('/api/ui/admin-features')
+def get_admin_features():
+    """API endpoint to get admin UI features based on authentication"""
+    admin_logged_in = bool(session.get('admin_logged_in') and session.get('user_id'))
+    
+    # Verify user still exists in database if session says logged in
+    if admin_logged_in:
+        conn = sqlite3.connect('yaraman.db')
+        cursor = conn.cursor()
+        cursor.execute('SELECT role FROM users WHERE id = ?', (session.get('user_id'),))
+        user = cursor.fetchone()
+        conn.close()
+        
+        if not user or user[0] != 'admin':
+            session.clear()
+            admin_logged_in = False
+    
+    return jsonify({
+        'show_upload_button': admin_logged_in,
+        'show_delete_buttons': admin_logged_in,
+        'show_admin_dropdown': admin_logged_in,
+        'show_login_button': not admin_logged_in,
+        'can_access_rules_page': admin_logged_in
+    })
+
 @app.route('/assets/<path:filename>')
 def assets(filename):
     """Serve static assets"""
     return send_from_directory('assets', filename)
+
+@app.route('/api/auth/login', methods=['POST'])
+def admin_login():
+    """Admin login endpoint"""
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'No data provided'}), 400
+        
+        username = data.get('username')
+        password = data.get('password')
+        
+        if not username or not password:
+            return jsonify({'error': 'Username and password required'}), 400
+        
+        user = authenticate_user(username, password)
+        if user:
+            session['admin_logged_in'] = True
+            session['user_id'] = user['id']
+            session['username'] = user['username']
+            
+            # Update last login timestamp
+            update_last_login(user['id'])
+            
+            return jsonify({'message': 'Login successful', 'admin': True})
+        else:
+            return jsonify({'error': 'Invalid credentials'}), 401
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/auth/logout', methods=['POST'])
+def admin_logout():
+    """Admin logout endpoint"""
+    session.clear()
+    return jsonify({'message': 'Logout successful'})
+
+@app.route('/api/auth/status')
+def auth_status():
+    """Check current authentication status"""
+    admin_logged_in = bool(session.get('admin_logged_in') and session.get('user_id'))
+    
+    # Verify user still exists in database if session says logged in
+    if admin_logged_in:
+        conn = sqlite3.connect('yaraman.db')
+        cursor = conn.cursor()
+        cursor.execute('SELECT role FROM users WHERE id = ?', (session.get('user_id'),))
+        user = cursor.fetchone()
+        conn.close()
+        
+        if not user or user[0] != 'admin':
+            session.clear()
+            admin_logged_in = False
+    
+    return jsonify({
+        'admin_logged_in': admin_logged_in,
+        'username': session.get('username') if admin_logged_in else None
+    })
 
 @app.route('/api/yara/rules')
 def list_yara_rules():
@@ -222,7 +491,8 @@ def list_yara_rules():
 def get_yara_rule(filename):
     """API endpoint to get a specific YARA rule content"""
     try:
-        if not filename.endswith(('.yar', '.yara')):
+        allowed_extensions = tuple(ext.strip() for ext in config.get('security', 'file_extensions_yara').split(','))
+        if not filename.endswith(allowed_extensions):
             return jsonify({'error': 'Invalid file extension'}), 400
         
         filepath = os.path.join(app.config['YARA_RULES_FOLDER'], filename)
@@ -237,6 +507,7 @@ def get_yara_rule(filename):
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/yara/rules', methods=['POST'])
+@admin_required
 def upload_yara_rule():
     """API endpoint to upload YARA rule(s)"""
     try:
@@ -258,8 +529,9 @@ def upload_yara_rule():
         if file.filename.lower().endswith('.zip'):
             try:
                 with zipfile.ZipFile(file) as zip_file:
+                    allowed_extensions = tuple(ext.strip() for ext in config.get('security', 'file_extensions_yara').split(','))
                     for zip_info in zip_file.infolist():
-                        if zip_info.filename.endswith(('.yar', '.yara')) and not zip_info.is_dir():
+                        if zip_info.filename.endswith(allowed_extensions) and not zip_info.is_dir():
                             # Extract and validate YARA rule
                             rule_content = zip_file.read(zip_info).decode('utf-8')
                             is_valid, error = validate_yara_rule(rule_content)
@@ -298,7 +570,7 @@ def upload_yara_rule():
                 return jsonify({'error': f'Error processing ZIP file: {str(e)}'}), 500
         
         # Handle single YARA rule files
-        elif file.filename.lower().endswith(('.yar', '.yara')):
+        elif file.filename.lower().endswith(tuple(ext.strip() for ext in config.get('security', 'file_extensions_yara').split(','))):
             rule_content = file.read().decode('utf-8')
             is_valid, error = validate_yara_rule(rule_content)
             
@@ -331,7 +603,8 @@ def upload_yara_rule():
                     'message': f'Invalid YARA rule: {error}'
                 })
         else:
-            return jsonify({'error': 'Invalid file type. Only .yar, .yara, and .zip files are allowed'}), 400
+            allowed_exts = config.get('security', 'file_extensions_yara')
+            return jsonify({'error': f'Invalid file type. Only {allowed_exts} and .zip files are allowed'}), 400
         
         return jsonify({'results': results})
     
@@ -339,10 +612,12 @@ def upload_yara_rule():
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/yara/rules/<filename>', methods=['DELETE'])
+@admin_required
 def delete_yara_rule(filename):
     """API endpoint to delete a YARA rule"""
     try:
-        if not filename.endswith(('.yar', '.yara')):
+        allowed_extensions = tuple(ext.strip() for ext in config.get('security', 'file_extensions_yara').split(','))
+        if not filename.endswith(allowed_extensions):
             return jsonify({'error': 'Invalid file extension'}), 400
         
         filepath = os.path.join(app.config['YARA_RULES_FOLDER'], filename)
@@ -404,14 +679,17 @@ def scan_files():
         return jsonify({'error': str(e)}), 500
 
 def init_app():
-    """Initialize the application directories"""
+    """Initialize the application directories and database"""
     if not os.path.exists(app.config['YARA_RULES_FOLDER']):
         os.makedirs(app.config['YARA_RULES_FOLDER'])
     if not os.path.exists(app.config['UPLOAD_FOLDER']):
         os.makedirs(app.config['UPLOAD_FOLDER'])
+    
+    # Initialize database
+    init_database()
 
 # Initialize on startup
 init_app()
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5002)
+    app.run(debug=app.config['DEBUG'], host=app.config['HOST'], port=app.config['PORT'])
