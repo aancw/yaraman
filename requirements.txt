@@ -1,0 +1,3 @@
+Flask==3.0.3
+yara-python==4.5.1
+Werkzeug==3.0.3
