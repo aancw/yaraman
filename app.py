@@ -538,8 +538,16 @@ def get_file_hash(file_path, hash_type='sha256'):
         return None
 
 @app.route('/')
-def index():
-    """Main page"""
+@app.route('/<path:path>')
+def index(path=''):
+    """Main page - catch all routes for SPA"""
+    # Serve API routes normally (they have their own handlers)
+    if path.startswith('api/') or path.startswith('assets/'):
+        # Let Flask handle 404 for missing API/asset routes
+        from flask import abort
+        abort(404)
+    
+    # Serve index.html for all other routes (SPA routing)
     return send_from_directory('.', 'index.html')
 
 @app.route('/api/ui/admin-features')
