@@ -62,3 +62,4 @@ logs/
 # Temporary files
 *.tmp
 *.temp
+yaraman.db

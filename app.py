@@ -5,7 +5,7 @@ YaraMan - YARA Rules Manager & File Scanner
 A standalone Flask application for managing YARA rules and scanning files.
 """
 
-from flask import Flask, render_template, request, jsonify, send_from_directory, session
+from flask import Flask, render_template, request, jsonify, send_from_directory, make_response
 import os
 import json
 import zipfile
@@ -17,6 +17,8 @@ from werkzeug.utils import secure_filename
 from werkzeug.security import generate_password_hash, check_password_hash
 from functools import wraps
 import configparser
+import secrets
+from datetime import timedelta
 
 def load_config(config_file='app.conf'):
     """Load configuration from app.conf file with environment variable override"""
@@ -126,6 +128,24 @@ def init_database():
         )
     ''')
     
+    # Create sessions table for complete server-side session management
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS user_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT UNIQUE NOT NULL,
+            user_id INTEGER NOT NULL,
+            username TEXT NOT NULL,
+            role TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            expires_at TIMESTAMP NOT NULL,
+            last_accessed TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            is_valid BOOLEAN DEFAULT 1,
+            ip_address TEXT,
+            user_agent TEXT,
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+    ''')
+    
     # Create default admin user if none exists
     cursor.execute('SELECT COUNT(*) FROM users WHERE role = "admin"')
     admin_count = cursor.fetchone()[0]
@@ -167,37 +187,169 @@ def authenticate_user(username, password):
         }
     return None
 
-def update_last_login(user_id):
-    """Update user's last login timestamp"""
+def create_session(user_info, ip_address=None, user_agent=None):
+    """Create a new server-side session"""
+    session_id = secrets.token_urlsafe(32)
+    expires_at = datetime.now() + timedelta(hours=24)  # 24 hour session
+    
     conn = sqlite3.connect('yaraman.db')
     cursor = conn.cursor()
     
+    # Invalidate all existing sessions for this user
+    cursor.execute('''
+        UPDATE user_sessions 
+        SET is_valid = 0 
+        WHERE user_id = ? AND is_valid = 1
+    ''', (user_info['id'],))
+    
+    # Create new session with all user data stored server-side
+    cursor.execute('''
+        INSERT INTO user_sessions (
+            session_id, user_id, username, role, expires_at, 
+            ip_address, user_agent
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    ''', (session_id, user_info['id'], user_info['username'], 
+          user_info['role'], expires_at, ip_address, user_agent))
+    
+    # Update last login timestamp
     cursor.execute('''
         UPDATE users 
         SET last_login = CURRENT_TIMESTAMP
         WHERE id = ?
+    ''', (user_info['id'],))
+    
+    conn.commit()
+    conn.close()
+    
+    return session_id
+
+def get_session_data(session_id):
+    """Get session data from server-side storage"""
+    if not session_id:
+        return None
+    
+    conn = sqlite3.connect('yaraman.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        SELECT user_id, username, role, expires_at, ip_address, user_agent
+        FROM user_sessions
+        WHERE session_id = ? 
+        AND is_valid = 1 
+        AND expires_at > CURRENT_TIMESTAMP
+    ''', (session_id,))
+    
+    result = cursor.fetchone()
+    
+    if result:
+        # Update last accessed time
+        cursor.execute('''
+            UPDATE user_sessions 
+            SET last_accessed = CURRENT_TIMESTAMP
+            WHERE session_id = ?
+        ''', (session_id,))
+        conn.commit()
+        
+        conn.close()
+        return {
+            'user_id': result[0],
+            'username': result[1],
+            'role': result[2],
+            'expires_at': result[3],
+            'ip_address': result[4],
+            'user_agent': result[5]
+        }
+    
+    conn.close()
+    return None
+
+def invalidate_session(session_id):
+    """Invalidate a specific session"""
+    if not session_id:
+        return
+        
+    conn = sqlite3.connect('yaraman.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        UPDATE user_sessions 
+        SET is_valid = 0 
+        WHERE session_id = ?
+    ''', (session_id,))
+    
+    conn.commit()
+    conn.close()
+
+def invalidate_user_sessions(user_id):
+    """Invalidate all sessions for a user"""
+    conn = sqlite3.connect('yaraman.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        UPDATE user_sessions 
+        SET is_valid = 0 
+        WHERE user_id = ? AND is_valid = 1
     ''', (user_id,))
     
     conn.commit()
     conn.close()
 
+def cleanup_expired_sessions():
+    """Clean up expired sessions"""
+    conn = sqlite3.connect('yaraman.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        DELETE FROM user_sessions 
+        WHERE expires_at < CURRENT_TIMESTAMP OR is_valid = 0
+    ''')
+    
+    conn.commit()
+    conn.close()
+
+def get_session_id():
+    """Get session ID from request cookie"""
+    return request.cookies.get('yaraman_session_id')
+
+def set_session_cookie(response, session_id):
+    """Set secure session cookie"""
+    response.set_cookie(
+        'yaraman_session_id',
+        session_id,
+        max_age=24*60*60,  # 24 hours
+        httponly=True,     # Prevent JavaScript access
+        secure=False,      # Set to True in production with HTTPS
+        samesite='Lax'     # CSRF protection
+    )
+    return response
+
+def clear_session_cookie(response):
+    """Clear session cookie"""
+    response.set_cookie(
+        'yaraman_session_id',
+        '',
+        expires=0,
+        httponly=True,
+        secure=False,
+        samesite='Lax'
+    )
+    return response
+
 def admin_required(f):
     """Decorator to require admin authentication for YARA management endpoints"""
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        if not session.get('admin_logged_in') or not session.get('user_id'):
+        session_id = get_session_id()
+        if not session_id:
             return jsonify({'error': 'Admin authentication required'}), 401
         
-        # Verify user still exists in database
-        conn = sqlite3.connect('yaraman.db')
-        cursor = conn.cursor()
-        cursor.execute('SELECT role FROM users WHERE id = ?', (session.get('user_id'),))
-        user = cursor.fetchone()
-        conn.close()
-        
-        if not user or user[0] != 'admin':
-            session.clear()
+        # Get session data from server-side storage
+        session_data = get_session_data(session_id)
+        if not session_data or session_data['role'] != 'admin':
             return jsonify({'error': 'Admin authentication required'}), 401
+        
+        # Clean up expired sessions periodically
+        cleanup_expired_sessions()
             
         return f(*args, **kwargs)
     return decorated_function
@@ -393,19 +545,13 @@ def index():
 @app.route('/api/ui/admin-features')
 def get_admin_features():
     """API endpoint to get admin UI features based on authentication"""
-    admin_logged_in = bool(session.get('admin_logged_in') and session.get('user_id'))
+    session_id = get_session_id()
+    admin_logged_in = False
     
-    # Verify user still exists in database if session says logged in
-    if admin_logged_in:
-        conn = sqlite3.connect('yaraman.db')
-        cursor = conn.cursor()
-        cursor.execute('SELECT role FROM users WHERE id = ?', (session.get('user_id'),))
-        user = cursor.fetchone()
-        conn.close()
-        
-        if not user or user[0] != 'admin':
-            session.clear()
-            admin_logged_in = False
+    if session_id:
+        session_data = get_session_data(session_id)
+        if session_data and session_data['role'] == 'admin':
+            admin_logged_in = True
     
     return jsonify({
         'show_upload_button': admin_logged_in,
@@ -436,14 +582,18 @@ def admin_login():
         
         user = authenticate_user(username, password)
         if user:
-            session['admin_logged_in'] = True
-            session['user_id'] = user['id']
-            session['username'] = user['username']
+            # Get client info for session tracking
+            ip_address = request.environ.get('HTTP_X_FORWARDED_FOR', request.environ.get('REMOTE_ADDR'))
+            user_agent = request.headers.get('User-Agent')
             
-            # Update last login timestamp
-            update_last_login(user['id'])
+            # Create new server-side session
+            session_id = create_session(user, ip_address, user_agent)
             
-            return jsonify({'message': 'Login successful', 'admin': True})
+            # Create response with session cookie
+            response = make_response(jsonify({'message': 'Login successful', 'admin': True}))
+            response = set_session_cookie(response, session_id)
+            
+            return response
         else:
             return jsonify({'error': 'Invalid credentials'}), 401
     
@@ -453,29 +603,34 @@ def admin_login():
 @app.route('/api/auth/logout', methods=['POST'])
 def admin_logout():
     """Admin logout endpoint"""
-    session.clear()
-    return jsonify({'message': 'Logout successful'})
+    session_id = get_session_id()
+    
+    # Invalidate the session in database
+    if session_id:
+        invalidate_session(session_id)
+    
+    # Create response and clear session cookie
+    response = make_response(jsonify({'message': 'Logout successful'}))
+    response = clear_session_cookie(response)
+    
+    return response
 
 @app.route('/api/auth/status')
 def auth_status():
     """Check current authentication status"""
-    admin_logged_in = bool(session.get('admin_logged_in') and session.get('user_id'))
+    session_id = get_session_id()
+    admin_logged_in = False
+    username = None
     
-    # Verify user still exists in database if session says logged in
-    if admin_logged_in:
-        conn = sqlite3.connect('yaraman.db')
-        cursor = conn.cursor()
-        cursor.execute('SELECT role FROM users WHERE id = ?', (session.get('user_id'),))
-        user = cursor.fetchone()
-        conn.close()
-        
-        if not user or user[0] != 'admin':
-            session.clear()
-            admin_logged_in = False
+    if session_id:
+        session_data = get_session_data(session_id)
+        if session_data and session_data['role'] == 'admin':
+            admin_logged_in = True
+            username = session_data['username']
     
     return jsonify({
         'admin_logged_in': admin_logged_in,
-        'username': session.get('username') if admin_logged_in else None
+        'username': username
     })
 
 @app.route('/api/yara/rules')
