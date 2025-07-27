@@ -668,27 +668,64 @@ def scan_file_with_yara(file_path):
         # Scan file
         matches = compiled_rules.match(filepath=file_path)
         
+        # Filter out generic rules with excessive matches
+        filtered_matches = []
+        filtered_count = 0
+        for match in matches:
+            if is_generic_rule_match(match):
+                print(f"Filtering out generic rule match: {match.rule} (too many null bytes/wildcards)")
+                filtered_count += 1
+                continue
+            filtered_matches.append(match)
+        
+        if filtered_count > 0:
+            print(f"Filtered out {filtered_count} generic rule matches, showing {len(filtered_matches)} quality matches")
+        
         # Format matches
         formatted_matches = []
-        for match in matches:
-            formatted_matches.append({
+        for match in filtered_matches:
+            formatted_match = {
                 'rule': match.rule,
                 'tags': list(match.tags),
                 'namespace': match.namespace,
                 'meta': {key: value for key, value in match.meta.items()},
-                'strings': [
-                    {
-                        'identifier': s.identifier,
-                        'instances': [
-                            {
-                                'offset': instance.offset,
-                                'matched_length': len(instance.matched_data),
-                                'match_data': instance.matched_data.decode('utf-8', errors='replace')[:app.config['MAX_MATCH_DATA_LENGTH']]
-                            } for instance in s.instances[:app.config['MAX_STRING_INSTANCES']]
-                        ]
-                    } for s in match.strings[:app.config['MAX_STRINGS_PER_MATCH']]
-                ]
-            })
+                'strings': []
+            }
+            
+            for s in match.strings[:app.config['MAX_STRINGS_PER_MATCH']]:
+                string_info = {
+                    'identifier': s.identifier,
+                    'instances': [],
+                    'total_instances': len(s.instances)
+                }
+                
+                for instance in s.instances[:app.config['MAX_STRING_INSTANCES']]:
+                    raw_data = instance.matched_data
+                    hex_data = raw_data.hex().upper()
+                    
+                    # Try to show printable ASCII, fallback to hex if mostly binary
+                    try:
+                        ascii_data = raw_data.decode('ascii', errors='ignore')
+                        printable_chars = sum(1 for c in ascii_data if c.isprintable())
+                        if len(ascii_data) > 0 and printable_chars / len(ascii_data) > 0.7:
+                            display_data = ascii_data[:app.config['MAX_MATCH_DATA_LENGTH']]
+                        else:
+                            # Show hex data in readable format (space every 2 chars)
+                            display_data = ' '.join(hex_data[i:i+2] for i in range(0, min(len(hex_data), app.config['MAX_MATCH_DATA_LENGTH']*2), 2))
+                    except:
+                        # Fallback to hex display
+                        display_data = ' '.join(hex_data[i:i+2] for i in range(0, min(len(hex_data), app.config['MAX_MATCH_DATA_LENGTH']*2), 2))
+                    
+                    string_info['instances'].append({
+                        'offset': instance.offset,
+                        'matched_length': len(raw_data),
+                        'match_data': display_data,
+                        'hex_data': ' '.join(hex_data[i:i+2] for i in range(0, min(len(hex_data), 200), 2))  # First 100 bytes as hex
+                    })
+                
+                formatted_match['strings'].append(string_info)
+            
+            formatted_matches.append(formatted_match)
         
         return {
             'filename': filename,
@@ -705,6 +742,72 @@ def scan_file_with_yara(file_path):
             'matches': [],
             'error': f"Scan error: {str(e)}"
         }
+
+def is_generic_rule_match(match):
+    """
+    Analyze a YARA match to determine if it comes from a generic/low-quality rule.
+    This filters out rules that produce too many matches due to generic patterns.
+    
+    Args:
+        match: YARA match object
+        
+    Returns:
+        bool: True if match should be filtered out (generic rule), False otherwise
+    """
+    try:
+        # Criteria for generic rules:
+        # 1. Excessive number of matches (1000+ matches usually means overly generic pattern)
+        # 2. Matches that are too short (less than 8 bytes)
+        # 3. Matches consisting mostly of null bytes
+        
+        total_string_matches = len(match.strings)
+        if total_string_matches == 0:
+            return False  # No string data to analyze
+        
+        # Count total instances across all strings
+        total_instances = 0
+        null_heavy_strings = 0
+        
+        for string_match in match.strings:
+            instances = getattr(string_match, 'instances', [])
+            total_instances += len(instances)
+            
+            # Analyze the actual matched data for null byte content
+            for instance in instances[:5]:  # Check first few instances
+                matched_data = getattr(instance, 'matched_data', b'')
+                if len(matched_data) > 0:
+                    null_count = matched_data.count(b'\x00')
+                    null_ratio = null_count / len(matched_data)
+                    
+                    # Flag as generic if >70% null bytes and >50 bytes long
+                    if null_ratio > 0.7 and len(matched_data) > 50:
+                        null_heavy_strings += 1
+                        break  # One null-heavy instance is enough
+        
+        # Filter criteria:
+        # 1. More than 500 total instances (extremely generic)
+        if total_instances > 500:
+            print(f"Rule {match.rule} flagged: {total_instances} instances (too many)")
+            return True
+        
+        # 2. Multiple strings with high null byte content
+        if null_heavy_strings > 0 and total_instances > 100:
+            print(f"Rule {match.rule} flagged: null-heavy pattern with {total_instances} instances")
+            return True
+        
+        # 3. Special case: Rules with patterns like Microsoft_Visual_Cpp that match at wrong locations
+        # If rule name suggests it should match at entry point but has many scattered matches
+        rule_name = match.rule.lower()
+        if any(keyword in rule_name for keyword in ['microsoft', 'visual', 'cpp', 'compiler']):
+            if total_instances > 50:
+                print(f"Rule {match.rule} flagged: compiler signature with too many matches ({total_instances})")
+                return True
+        
+        return False
+        
+    except Exception as e:
+        print(f"Error analyzing match quality for {match.rule}: {e}")
+        return False  # If we can't analyze, don't filter it out
 
 def get_file_hash(file_path, hash_type='sha256'):
     """Calculate file hash"""
