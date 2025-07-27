@@ -14,6 +14,7 @@ import hashlib
 import sqlite3
 from datetime import datetime
 from werkzeug.utils import secure_filename
+import re
 from werkzeug.security import generate_password_hash, check_password_hash
 from functools import wraps
 import configparser
@@ -90,6 +91,34 @@ def load_config(config_file='app.conf'):
     
     return config
 
+def secure_path(path):
+    """Secure a file path while preserving directory structure"""
+    if not path:
+        return ""
+    
+    # Normalize path separators to forward slashes
+    path = path.replace('\\', '/')
+    
+    # Remove any leading/trailing slashes
+    path = path.strip('/')
+    
+    # Split into components and secure each part
+    parts = path.split('/')
+    secured_parts = []
+    
+    for part in parts:
+        # Skip empty parts and current/parent directory references
+        if not part or part in ('.', '..'):
+            continue
+        
+        # Secure each filename component individually
+        secured_part = secure_filename(part)
+        if secured_part:  # Only add non-empty parts
+            secured_parts.append(secured_part)
+    
+    # Rejoin with forward slashes
+    return '/'.join(secured_parts)
+
 # Load configuration
 config = load_config()
 
@@ -112,7 +141,7 @@ app.config['CHUNK_SIZE'] = config.getint('scanning', 'chunk_size')
 
 def init_database():
     """Initialize SQLite database for user management"""
-    db_path = 'yaraman.db'
+    db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'yaraman.db')
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     
@@ -146,6 +175,26 @@ def init_database():
         )
     ''')
     
+    # Create yara_rules table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS yara_rules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            filename TEXT NOT NULL,
+            full_path TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Add full_path column if it doesn't exist (for existing databases)
+    cursor.execute('''
+        PRAGMA table_info(yara_rules)
+    ''')
+    columns = [column[1] for column in cursor.fetchall()]
+    if 'full_path' not in columns:
+        cursor.execute('''
+            ALTER TABLE yara_rules ADD COLUMN full_path TEXT DEFAULT ''
+        ''')
+    
     # Create default admin user if none exists
     cursor.execute('SELECT COUNT(*) FROM users WHERE role = "admin"')
     admin_count = cursor.fetchone()[0]
@@ -165,9 +214,88 @@ def init_database():
     conn.commit()
     conn.close()
 
+def add_yara_rule_to_db(filename, full_path):
+    """Add a YARA rule to the database"""
+    db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'yaraman.db')
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        INSERT INTO yara_rules (filename, full_path)
+        VALUES (?, ?)
+    ''', (filename, full_path))
+    
+    rule_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return rule_id
+
+def get_yara_rule_from_db(rule_id):
+    """Get a YARA rule by ID from database"""
+    db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'yaraman.db')
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        SELECT id, filename, full_path, created_at
+        FROM yara_rules
+        WHERE id = ?
+    ''', (rule_id,))
+    
+    result = cursor.fetchone()
+    conn.close()
+    
+    if result:
+        return {
+            'id': result[0],
+            'filename': result[1],
+            'full_path': result[2],
+            'created_at': result[3]
+        }
+    return None
+
+def delete_yara_rule_from_db(rule_id):
+    """Delete a YARA rule from database"""
+    db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'yaraman.db')
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        DELETE FROM yara_rules
+        WHERE id = ?
+    ''', (rule_id,))
+    
+    deleted = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
+
+def get_all_yara_rules_from_db():
+    """Get all YARA rules from database"""
+    db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'yaraman.db')
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        SELECT id, filename, full_path, created_at
+        FROM yara_rules
+        ORDER BY filename
+    ''')
+    
+    results = cursor.fetchall()
+    conn.close()
+    
+    return [{
+        'id': row[0],
+        'filename': row[1],
+        'full_path': row[2],
+        'created_at': row[3]
+    } for row in results]
+
 def authenticate_user(username, password):
     """Authenticate user against database"""
-    conn = sqlite3.connect('yaraman.db')
+    db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'yaraman.db')
+    conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     
     cursor.execute('''
@@ -192,7 +320,8 @@ def create_session(user_info, ip_address=None, user_agent=None):
     session_id = secrets.token_urlsafe(32)
     expires_at = datetime.now() + timedelta(hours=24)  # 24 hour session
     
-    conn = sqlite3.connect('yaraman.db')
+    db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'yaraman.db')
+    conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     
     # Invalidate all existing sessions for this user
@@ -228,7 +357,8 @@ def get_session_data(session_id):
     if not session_id:
         return None
     
-    conn = sqlite3.connect('yaraman.db')
+    db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'yaraman.db')
+    conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     
     cursor.execute('''
@@ -268,7 +398,8 @@ def invalidate_session(session_id):
     if not session_id:
         return
         
-    conn = sqlite3.connect('yaraman.db')
+    db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'yaraman.db')
+    conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     
     cursor.execute('''
@@ -282,7 +413,8 @@ def invalidate_session(session_id):
 
 def invalidate_user_sessions(user_id):
     """Invalidate all sessions for a user"""
-    conn = sqlite3.connect('yaraman.db')
+    db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'yaraman.db')
+    conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     
     cursor.execute('''
@@ -296,7 +428,8 @@ def invalidate_user_sessions(user_id):
 
 def cleanup_expired_sessions():
     """Clean up expired sessions"""
-    conn = sqlite3.connect('yaraman.db')
+    db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'yaraman.db')
+    conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     
     cursor.execute('''
@@ -365,18 +498,17 @@ def validate_yara_rule(rule_content):
         return False, f"Validation error: {str(e)}"
 
 def get_yara_rules():
-    """Get list of available YARA rules"""
+    """Get list of available YARA rules from database"""
     rules = []
+    db_rules = get_all_yara_rules_from_db()
     yara_folder = app.config['YARA_RULES_FOLDER']
     
-    if not os.path.exists(yara_folder):
-        return rules
-    
-    allowed_extensions = tuple(ext.strip() for ext in config.get('security', 'file_extensions_yara').split(','))
-    for filename in os.listdir(yara_folder):
-        if filename.endswith(allowed_extensions):
-            filepath = os.path.join(yara_folder, filename)
-            try:
+    for db_rule in db_rules:
+        # Use full_path for file operations
+        filepath = os.path.join(yara_folder, db_rule['full_path']) if db_rule['full_path'] else os.path.join(yara_folder, db_rule['filename'])
+        
+        try:
+            if os.path.exists(filepath):
                 stat = os.stat(filepath)
                 with open(filepath, 'r', encoding='utf-8') as f:
                     content = f.read()
@@ -395,23 +527,42 @@ def get_yara_rules():
                         rule_names.append(rule_name)
                 
                 rules.append({
-                    'filename': filename,
+                    'id': db_rule['id'],
+                    'filename': db_rule['filename'],
+                    'full_path': db_rule['full_path'],
+                    'display_name': db_rule['filename'],  # Use filename as display name (just the filename, no path)
                     'size': stat.st_size,
                     'modified': datetime.fromtimestamp(stat.st_mtime).isoformat(),
                     'rule_names': rule_names,
                     'rule_count': len(rule_names)
                 })
-            except Exception as e:
+            else:
+                # File exists in DB but not on filesystem
                 rules.append({
-                    'filename': filename,
+                    'id': db_rule['id'],
+                    'filename': db_rule['filename'],
+                    'full_path': db_rule['full_path'],
+                    'display_name': db_rule['filename'],
                     'size': 0,
                     'modified': '',
                     'rule_names': [],
                     'rule_count': 0,
-                    'error': str(e)
+                    'error': 'File not found on filesystem'
                 })
+        except Exception as e:
+            rules.append({
+                'id': db_rule['id'],
+                'filename': db_rule['filename'],
+                'full_path': db_rule['full_path'],
+                'display_name': db_rule['filename'],
+                'size': 0,
+                'modified': '',
+                'rule_names': [],
+                'rule_count': 0,
+                'error': str(e)
+            })
     
-    return sorted(rules, key=lambda x: x['filename'])
+    return sorted(rules, key=lambda x: x['display_name'])
 
 def compile_yara_rules():
     """Compile all YARA rules for scanning"""
@@ -420,52 +571,82 @@ def compile_yara_rules():
     if not os.path.exists(yara_folder):
         return None
     
-    all_rules_source = {}
-    rule_count = 0
     compilation_errors = []
+    db_rules = get_all_yara_rules_from_db()
     
-    allowed_extensions = tuple(ext.strip() for ext in config.get('security', 'file_extensions_yara').split(','))
-    for filename in os.listdir(yara_folder):
-        if filename.endswith(allowed_extensions):
-            filepath = os.path.join(yara_folder, filename)
-            try:
-                with open(filepath, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                    
-                    # Try to compile individual rule to validate it (including imports)
-                    try:
-                        yara.compile(source=content)
-                        namespace = f"rules_{rule_count}"
-                        all_rules_source[namespace] = content
-                        rule_count += 1
-                        print(f"Successfully added rule: {filename}")
-                    except Exception as rule_error:
-                        print(f"Error validating YARA rule {filename}: {rule_error}")
-                        compilation_errors.append(f"{filename}: {str(rule_error)}")
-                        
-            except Exception as e:
-                print(f"Error reading YARA rule {filename}: {e}")
-                compilation_errors.append(f"{filename}: {str(e)}")
-    
-    if not all_rules_source:
-        print("No valid YARA rules found for compilation")
-        if compilation_errors:
-            print("Compilation errors:")
-            for error in compilation_errors:
-                print(f"  - {error}")
-        return None
+    # Build a dictionary of filepaths with proper namespace handling
+    all_filepaths = {}
+    old_cwd = os.getcwd()
     
     try:
-        compiled_rules = yara.compile(sources=all_rules_source)
-        print(f"Successfully compiled {len(all_rules_source)} YARA rule file(s)")
+        # Don't change working directory yet - first validate paths with absolute paths
+        print(f"Processing {len(db_rules)} rules from database...")
+        
+        for i, db_rule in enumerate(db_rules):
+            # Use full_path for file operations
+            if db_rule['full_path']:
+                relative_filepath = db_rule['full_path']
+            else:
+                relative_filepath = db_rule['filename']
+            
+            # Full absolute path to the file
+            full_filepath = os.path.join(yara_folder, relative_filepath)
+            
+            if os.path.exists(full_filepath):
+                try:
+                    # Test compile individual rule first to validate
+                    # Change to the specific directory where the rule is located
+                    rule_dir = os.path.dirname(full_filepath)
+                    if rule_dir and rule_dir != yara_folder:
+                        test_cwd = os.getcwd()
+                        os.chdir(rule_dir)
+                        # Use just the filename for compilation from its directory
+                        yara.compile(filepath=os.path.basename(full_filepath))
+                        os.chdir(test_cwd)
+                        print(f"Successfully validated rule: {db_rule['filename']}")
+                    else:
+                        # If rule is in root yara folder, compile with relative path
+                        yara.compile(filepath=relative_filepath)
+                        print(f"Successfully validated rule: {db_rule['filename']}")
+                    
+                    # Add to compilation list using relative path from yara_folder
+                    namespace = f"rules_{i}"
+                    all_filepaths[namespace] = relative_filepath
+                    
+                except Exception as rule_error:
+                    print(f"Error validating YARA rule {db_rule['filename']}: {rule_error}")
+                    compilation_errors.append(f"{db_rule['filename']}: {str(rule_error)}")
+            else:
+                print(f"YARA rule file not found: {full_filepath}")
+                compilation_errors.append(f"{db_rule['filename']}: File not found")
+        
+        if not all_filepaths:
+            print("No valid YARA rules found for compilation")
+            if compilation_errors:
+                print("Compilation errors:")
+                for error in compilation_errors:
+                    print(f"  - {error}")
+            return None
+        
+        # Final compilation of all valid rules
+        # Change to yara rules folder for final compilation to resolve includes
+        os.chdir(yara_folder)
+        compiled_rules = yara.compile(filepaths=all_filepaths)
+        print(f"Successfully compiled {len(all_filepaths)} YARA rule file(s)")
+        
         if compilation_errors:
             print("Some rules were skipped:")
             for error in compilation_errors:
                 print(f"  - {error}")
+        
         return compiled_rules
+        
     except Exception as e:
         print(f"Error compiling YARA rules: {e}")
         return None
+    finally:
+        # Restore working directory
+        os.chdir(old_cwd)
 
 def scan_file_with_yara(file_path):
     """Scan a file with compiled YARA rules"""
@@ -650,22 +831,31 @@ def list_yara_rules():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/yara/rules/<filename>')
-def get_yara_rule(filename):
-    """API endpoint to get a specific YARA rule content"""
+@app.route('/api/yara/rules/<int:rule_id>')
+def get_yara_rule(rule_id):
+    """API endpoint to get a specific YARA rule content by ID"""
     try:
-        allowed_extensions = tuple(ext.strip() for ext in config.get('security', 'file_extensions_yara').split(','))
-        if not filename.endswith(allowed_extensions):
-            return jsonify({'error': 'Invalid file extension'}), 400
+        # Get rule from database
+        db_rule = get_yara_rule_from_db(rule_id)
+        if not db_rule:
+            return jsonify({'error': 'Rule not found'}), 404
         
-        filepath = os.path.join(app.config['YARA_RULES_FOLDER'], filename)
+        # Use full_path for file operations
+        filepath = os.path.join(app.config['YARA_RULES_FOLDER'], db_rule['full_path']) if db_rule['full_path'] else os.path.join(app.config['YARA_RULES_FOLDER'], db_rule['filename'])
+        
         if not os.path.exists(filepath):
-            return jsonify({'error': 'Rule file not found'}), 404
+            return jsonify({'error': 'Rule file not found on filesystem'}), 404
         
         with open(filepath, 'r', encoding='utf-8') as f:
             content = f.read()
         
-        return jsonify({'filename': filename, 'content': content})
+        return jsonify({
+            'id': db_rule['id'],
+            'filename': db_rule['filename'],
+            'full_path': db_rule['full_path'],
+            'display_name': db_rule['filename'],
+            'content': content
+        })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -693,40 +883,91 @@ def upload_yara_rule():
             try:
                 with zipfile.ZipFile(file) as zip_file:
                     allowed_extensions = tuple(ext.strip() for ext in config.get('security', 'file_extensions_yara').split(','))
+                    
+                    # First pass: Extract all files to temporary locations
+                    extracted_files = []
                     for zip_info in zip_file.infolist():
                         if zip_info.filename.endswith(allowed_extensions) and not zip_info.is_dir():
-                            # Extract and validate YARA rule
                             rule_content = zip_file.read(zip_info).decode('utf-8')
-                            is_valid, error = validate_yara_rule(rule_content)
+                            original_path = zip_info.filename
+                            rule_filename = os.path.basename(original_path)
+                            rule_full_path = secure_path(original_path)
+                            rule_path = os.path.join(yara_folder, rule_full_path)
+                            
+                            # Create subdirectories if they don't exist
+                            rule_dir = os.path.dirname(rule_path)
+                            if rule_dir and not os.path.exists(rule_dir):
+                                os.makedirs(rule_dir)
+                            
+                            # Handle filename conflicts
+                            counter = 1
+                            original_full_path = rule_full_path
+                            original_filename = rule_filename
+                            while os.path.exists(rule_path):
+                                name, ext = os.path.splitext(original_filename)
+                                rule_filename = f"{name}_{counter}{ext}"
+                                dir_part = os.path.dirname(original_full_path)
+                                rule_full_path = os.path.join(dir_part, rule_filename) if dir_part else rule_filename
+                                rule_path = os.path.join(yara_folder, rule_full_path)
+                                counter += 1
+                            
+                            # Write file to filesystem first
+                            with open(rule_path, 'w', encoding='utf-8') as f:
+                                f.write(rule_content)
+                            
+                            extracted_files.append({
+                                'original_path': original_path,
+                                'rule_filename': rule_filename,
+                                'rule_full_path': rule_full_path,
+                                'rule_path': rule_path,
+                                'rule_content': rule_content
+                            })
+                    
+                    # Second pass: Validate all extracted files (now includes will work)
+                    for file_info in extracted_files:
+                        try:
+                            # Change to the file's directory for validation (to resolve includes)
+                            old_cwd = os.getcwd()
+                            rule_dir = os.path.dirname(file_info['rule_path'])
+                            if rule_dir:
+                                os.chdir(rule_dir)
+                            
+                            is_valid, error = validate_yara_rule(file_info['rule_content'])
                             
                             if is_valid:
-                                # Save the rule file
-                                rule_filename = secure_filename(os.path.basename(zip_info.filename))
-                                rule_path = os.path.join(yara_folder, rule_filename)
-                                
-                                # Handle filename conflicts
-                                counter = 1
-                                original_filename = rule_filename
-                                while os.path.exists(rule_path):
-                                    name, ext = os.path.splitext(original_filename)
-                                    rule_filename = f"{name}_{counter}{ext}"
-                                    rule_path = os.path.join(yara_folder, rule_filename)
-                                    counter += 1
-                                
-                                with open(rule_path, 'w', encoding='utf-8') as f:
-                                    f.write(rule_content)
+                                # Add to database with filename and full_path
+                                rule_id = add_yara_rule_to_db(file_info['rule_filename'], file_info['rule_full_path'])
                                 
                                 results.append({
-                                    'filename': rule_filename,
+                                    'id': rule_id,
+                                    'filename': file_info['rule_filename'],
+                                    'full_path': file_info['rule_full_path'],
                                     'status': 'success',
                                     'message': 'Rule uploaded successfully'
                                 })
                             else:
+                                # Remove the file if validation failed
+                                if os.path.exists(file_info['rule_path']):
+                                    os.remove(file_info['rule_path'])
+                                
                                 results.append({
-                                    'filename': zip_info.filename,
+                                    'filename': file_info['original_path'],
                                     'status': 'error',
                                     'message': f'Invalid YARA rule: {error}'
                                 })
+                        except Exception as e:
+                            # Remove the file if validation failed
+                            if os.path.exists(file_info['rule_path']):
+                                os.remove(file_info['rule_path'])
+                            
+                            results.append({
+                                'filename': file_info['original_path'],
+                                'status': 'error',
+                                'message': f'Validation error: {str(e)}'
+                            })
+                        finally:
+                            # Restore working directory
+                            os.chdir(old_cwd)
             except zipfile.BadZipFile:
                 return jsonify({'error': 'Invalid ZIP file'}), 400
             except Exception as e:
@@ -740,6 +981,7 @@ def upload_yara_rule():
             if is_valid:
                 # Save the rule file
                 rule_filename = secure_filename(file.filename)
+                rule_full_path = rule_filename  # For single files, full_path is same as filename
                 rule_path = os.path.join(yara_folder, rule_filename)
                 
                 # Handle filename conflicts
@@ -748,14 +990,20 @@ def upload_yara_rule():
                 while os.path.exists(rule_path):
                     name, ext = os.path.splitext(original_filename)
                     rule_filename = f"{name}_{counter}{ext}"
+                    rule_full_path = rule_filename
                     rule_path = os.path.join(yara_folder, rule_filename)
                     counter += 1
                 
                 with open(rule_path, 'w', encoding='utf-8') as f:
                     f.write(rule_content)
                 
+                # Add to database with filename and full_path
+                rule_id = add_yara_rule_to_db(rule_filename, rule_full_path)
+                
                 results.append({
+                    'id': rule_id,
                     'filename': rule_filename,
+                    'full_path': rule_full_path,
                     'status': 'success',
                     'message': 'Rule uploaded successfully'
                 })
@@ -774,21 +1022,64 @@ def upload_yara_rule():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/yara/rules/<filename>', methods=['DELETE'])
+@app.route('/api/yara/rules/<int:rule_id>', methods=['DELETE'])
 @admin_required
-def delete_yara_rule(filename):
-    """API endpoint to delete a YARA rule"""
+def delete_yara_rule(rule_id):
+    """API endpoint to delete a YARA rule by ID"""
     try:
-        allowed_extensions = tuple(ext.strip() for ext in config.get('security', 'file_extensions_yara').split(','))
-        if not filename.endswith(allowed_extensions):
-            return jsonify({'error': 'Invalid file extension'}), 400
+        # Get rule from database
+        db_rule = get_yara_rule_from_db(rule_id)
+        if not db_rule:
+            return jsonify({'error': 'Rule not found'}), 404
         
-        filepath = os.path.join(app.config['YARA_RULES_FOLDER'], filename)
-        if not os.path.exists(filepath):
-            return jsonify({'error': 'Rule file not found'}), 404
+        # Use full_path for file operations
+        filepath = os.path.join(app.config['YARA_RULES_FOLDER'], db_rule['full_path']) if db_rule['full_path'] else os.path.join(app.config['YARA_RULES_FOLDER'], db_rule['filename'])
         
-        os.remove(filepath)
-        return jsonify({'message': 'Rule deleted successfully'})
+        # Delete file if it exists
+        if os.path.exists(filepath):
+            os.remove(filepath)
+        
+        # Delete from database
+        deleted = delete_yara_rule_from_db(rule_id)
+        if deleted:
+            return jsonify({'message': 'Rule deleted successfully'})
+        else:
+            return jsonify({'error': 'Failed to delete rule from database'}), 500
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/yara/cleanup-orphaned', methods=['POST'])
+@admin_required
+def cleanup_non_existent_rules():
+    """API endpoint to remove all non-existent YARA rules from database"""
+    try:
+        db_rules = get_all_yara_rules_from_db()
+        yara_folder = app.config['YARA_RULES_FOLDER']
+        
+        removed_count = 0
+        removed_rules = []
+        
+        for db_rule in db_rules:
+            # Use full_path for file operations
+            filepath = os.path.join(yara_folder, db_rule['full_path']) if db_rule['full_path'] else os.path.join(yara_folder, db_rule['filename'])
+            
+            # If file doesn't exist, remove from database
+            if not os.path.exists(filepath):
+                deleted = delete_yara_rule_from_db(db_rule['id'])
+                if deleted:
+                    removed_count += 1
+                    removed_rules.append({
+                        'id': db_rule['id'],
+                        'filename': db_rule['filename'],
+                        'full_path': db_rule['full_path']
+                    })
+        
+        return jsonify({
+            'message': f'Successfully removed {removed_count} non-existent rule(s) from database',
+            'removed_count': removed_count,
+            'removed_rules': removed_rules
+        })
     
     except Exception as e:
         return jsonify({'error': str(e)}), 500

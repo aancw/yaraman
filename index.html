@@ -186,9 +186,14 @@
                                 <h2 class="fw-bold mb-2">YARA Rules Management</h2>
                                 <p class="text-muted">Manage and upload YARA rules for malware detection and analysis</p>
                             </div>
-                            <button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#uploadModal" id="upload-rules-btn">
-                                <i class="fas fa-upload me-2"></i>Upload Rules
-                            </button>
+                            <div class="btn-group" role="group">
+                                <button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#uploadModal" id="upload-rules-btn">
+                                    <i class="fas fa-upload me-2"></i>Upload Rules
+                                </button>
+                                <button class="btn btn-outline-warning" onclick="removeAllNonExistentRules()" id="remove-non-existent-btn" style="display: none;">
+                                    <i class="fas fa-broom me-2"></i>Remove All Non-Existent
+                                </button>
+                            </div>
                         </div>
 
                         <!-- Statistics Cards -->
@@ -397,6 +402,31 @@
                                 <span class="visually-hidden">Loading...</span>
                             </div>
                             <p class="mt-2 text-muted">Loading rule content...</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- All Rules Modal -->
+    <div class="modal fade" id="allRulesModal" tabindex="-1" aria-labelledby="allRulesModalLabel" aria-hidden="true">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="allRulesModalLabel">
+                        <i class="fas fa-shield-alt text-primary me-2"></i>
+                        All Rules
+                    </h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body">
+                    <div id="all-rules-content">
+                        <div class="text-center py-4">
+                            <div class="spinner-border text-primary" role="status">
+                                <span class="visually-hidden">Loading...</span>
+                            </div>
+                            <p class="mt-2 text-muted">Loading rules...</p>
                         </div>
                     </div>
                 </div>
@@ -630,6 +660,17 @@
 
         function displayRules(rules) {
             const tableBody = document.getElementById('rules-table');
+            const removeNonExistentBtn = document.getElementById('remove-non-existent-btn');
+            
+            // Check if there are any rules with errors (non-existent files)
+            const hasNonExistentRules = rules.some(rule => rule.error);
+            
+            // Show/hide the bulk remove button based on admin status and presence of non-existent rules
+            if (removeNonExistentBtn && window.adminFeatures && window.adminFeatures.show_delete_buttons && hasNonExistentRules) {
+                removeNonExistentBtn.style.display = 'block';
+            } else if (removeNonExistentBtn) {
+                removeNonExistentBtn.style.display = 'none';
+            }
             
             if (rules.length === 0) {
                 tableBody.innerHTML = `
@@ -648,7 +689,7 @@
                     <td>
                         <div class="d-flex align-items-center">
                             <i class="fas fa-file-code text-primary me-2"></i>
-                            <span class="fw-semibold">${escapeHtml(rule.filename)}</span>
+                            <span class="fw-semibold">${escapeHtml(rule.display_name || rule.filename)}</span>
                             ${rule.error ? '<i class="fas fa-exclamation-triangle text-warning ms-2" title="Error reading file"></i>' : ''}
                         </div>
                     </td>
@@ -657,7 +698,7 @@
                         ${rule.rule_names.length > 0 ? `
                         <div class="small text-muted mt-1">
                             ${rule.rule_names.slice(0, 3).map(name => `<code>${escapeHtml(name)}</code>`).join(', ')}
-                            ${rule.rule_names.length > 3 ? `<span class="text-muted"> +${rule.rule_names.length - 3} more</span>` : ''}
+                            ${rule.rule_names.length > 3 ? `<button class="btn btn-link btn-sm p-0 ms-1 text-muted" onclick="showAllRulesPopup(${rule.id}, '${escapeHtml(rule.display_name || rule.filename)}', ${JSON.stringify(rule.rule_names).replace(/"/g, '&quot;')})">+${rule.rule_names.length - 3} more</button>` : ''}
                         </div>
                         ` : ''}
                     </td>
@@ -665,13 +706,21 @@
                     <td>${formatDate(rule.modified)}</td>
                     <td>
                         <div class="btn-group btn-group-sm" role="group">
-                            <button type="button" class="btn btn-outline-primary" onclick="viewRule('${escapeHtml(rule.filename)}')" title="View Rule">
+                            ${!rule.error ? `
+                            <button type="button" class="btn btn-outline-primary" onclick="viewRule(${rule.id})" title="View Rule">
                                 <i class="fas fa-eye"></i>
                             </button>
+                            ` : ''}
                             ${(window.adminFeatures && window.adminFeatures.show_delete_buttons) ? `
-                            <button type="button" class="btn btn-outline-danger" onclick="deleteRule('${escapeHtml(rule.filename)}')" title="Delete Rule">
-                                <i class="fas fa-trash"></i>
-                            </button>
+                                ${!rule.error ? `
+                                <button type="button" class="btn btn-outline-danger" onclick="deleteRule(${rule.id}, '${escapeHtml(rule.display_name)}')" title="Delete Rule">
+                                    <i class="fas fa-trash"></i>
+                                </button>
+                                ` : `
+                                <button type="button" class="btn btn-outline-warning" onclick="removeNonExistentRule(${rule.id}, '${escapeHtml(rule.display_name)}')" title="Remove non-existent rule from database">
+                                    <i class="fas fa-unlink"></i> Remove
+                                </button>
+                                `}
                             ` : ''}
                         </div>
                     </td>
@@ -700,11 +749,11 @@
             loadRules();
         }
 
-        function viewRule(filename) {
+        function viewRule(ruleId) {
             const modal = new bootstrap.Modal(document.getElementById('ruleDetailsModal'));
             document.getElementById('ruleDetailsModalLabel').innerHTML = `
                 <i class="fas fa-code text-primary me-2"></i>
-                YARA Rule Details - ${escapeHtml(filename)}
+                YARA Rule Details
             `;
             
             document.getElementById('rule-content').innerHTML = `
@@ -718,7 +767,7 @@
             
             modal.show();
 
-            fetch(`/api/yara/rules/${encodeURIComponent(filename)}`)
+            fetch(`/api/yara/rules/${ruleId}`)
                 .then(response => response.json())
                 .then(data => {
                     if (data.error) {
@@ -730,6 +779,12 @@
                         `;
                         return;
                     }
+                    
+                    // Update modal title with display name
+                    document.getElementById('ruleDetailsModalLabel').innerHTML = `
+                        <i class="fas fa-code text-primary me-2"></i>
+                        YARA Rule Details - ${escapeHtml(data.display_name)}
+                    `;
                     
                     document.getElementById('rule-content').innerHTML = `
                         <pre><code class="language-yara">${escapeHtml(data.content)}</code></pre>
@@ -746,12 +801,12 @@
                 });
         }
 
-        function deleteRule(filename) {
-            if (!confirm(`Are you sure you want to delete "${filename}"? This action cannot be undone.`)) {
+        function deleteRule(ruleId, displayName) {
+            if (!confirm(`Are you sure you want to delete "${displayName}"? This action cannot be undone.`)) {
                 return;
             }
 
-            fetch(`/api/yara/rules/${encodeURIComponent(filename)}`, {
+            fetch(`/api/yara/rules/${ruleId}`, {
                 method: 'DELETE'
             })
             .then(response => {
@@ -777,6 +832,92 @@
                 }
                 console.error('Error deleting rule:', error);
                 showError('Failed to delete rule');
+            });
+        }
+
+        function removeNonExistentRule(ruleId, displayName) {
+            if (!confirm(`Remove "${displayName}" from database? The file no longer exists on the filesystem.`)) {
+                return;
+            }
+
+            fetch(`/api/yara/rules/${ruleId}`, {
+                method: 'DELETE'
+            })
+            .then(response => {
+                if (response.status === 401) {
+                    updateUIBasedOnAuth();
+                    showLoginModal();
+                    return Promise.reject(new Error('Authentication required'));
+                }
+                return response.json();
+            })
+            .then(data => {
+                if (data.error) {
+                    showError('Failed to remove rule: ' + data.error);
+                    return;
+                }
+                
+                showSuccess('Rule removed from database successfully');
+                loadRules();
+            })
+            .catch(error => {
+                if (error.message === 'Authentication required') {
+                    return;
+                }
+                console.error('Error removing rule:', error);
+                showError('Failed to remove rule');
+            });
+        }
+
+        function removeAllNonExistentRules() {
+            if (!confirm('Remove all non-existent rules from database? This will clean up all entries where the files no longer exist on the filesystem.')) {
+                return;
+            }
+
+            // Show progress indicator
+            const button = document.getElementById('remove-non-existent-btn');
+            const originalText = button.innerHTML;
+            button.innerHTML = '<i class="fas fa-spinner fa-spin me-2"></i>Cleaning...';
+            button.disabled = true;
+
+            fetch('/api/yara/cleanup-orphaned', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                }
+            })
+            .then(response => {
+                if (response.status === 401) {
+                    updateUIBasedOnAuth();
+                    showLoginModal();
+                    return Promise.reject(new Error('Authentication required'));
+                }
+                return response.json();
+            })
+            .then(data => {
+                if (data.error) {
+                    showError('Failed to clean up rules: ' + data.error);
+                    return;
+                }
+                
+                if (data.removed_count > 0) {
+                    showSuccess(`Successfully removed ${data.removed_count} non-existent rule(s) from database`);
+                } else {
+                    showSuccess('No non-existent rules found to remove');
+                }
+                loadRules();
+            })
+            .catch(error => {
+                if (error.message === 'Authentication required') {
+                    return;
+                }
+                console.error('Error cleaning up rules:', error);
+                showError('Failed to clean up rules');
+            })
+            .finally(() => {
+                // Restore button
+                button.innerHTML = originalText;
+                button.disabled = false;
             });
         }
 
@@ -1127,6 +1268,36 @@
             const div = document.createElement('div');
             div.textContent = text;
             return div.innerHTML;
+        }
+
+        function showAllRulesPopup(ruleId, fileName, ruleNames) {
+            const modal = new bootstrap.Modal(document.getElementById('allRulesModal'));
+            
+            // Update modal title
+            document.getElementById('allRulesModalLabel').innerHTML = `
+                <i class="fas fa-shield-alt text-primary me-2"></i>
+                All Rules - ${escapeHtml(fileName)}
+            `;
+            
+            // Display all rule names in a formatted list
+            const content = document.getElementById('all-rules-content');
+            content.innerHTML = `
+                <div class="mb-3">
+                    <p class="text-muted">This file contains ${ruleNames.length} YARA rule${ruleNames.length !== 1 ? 's' : ''}:</p>
+                </div>
+                <div class="row">
+                    ${ruleNames.map((name, index) => `
+                        <div class="col-md-6 mb-2">
+                            <div class="d-flex align-items-center">
+                                <span class="badge bg-secondary me-2">${index + 1}</span>
+                                <code class="small">${escapeHtml(name)}</code>
+                            </div>
+                        </div>
+                    `).join('')}
+                </div>
+            `;
+            
+            modal.show();
         }
     </script>
 </body>
