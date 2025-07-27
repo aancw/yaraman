@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  yaraman:
+    build: .
+    ports:
+      - "5002:5002"
+    volumes:
+      # Persist YARA rules and uploads
+      - yaraman_rules:/app/yara_rules
+      - yaraman_uploads:/app/uploads
+      - yaraman_db:/app
+      # Optional: Mount custom config
+      - ./app.conf:/app/app.conf:ro
+    environment:
+      - FLASK_ENV=production
+      - PYTHONPATH=/app
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5002')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  yaraman_rules:
+    driver: local
+  yaraman_uploads:
+    driver: local
+  yaraman_db:
+    driver: local

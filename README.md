@@ -37,6 +37,7 @@ YaraMan is a standalone web application for managing YARA rules and scanning fil
 ### Prerequisites
 - Python 3.8 or higher
 - YARA library installed on your system
+- Docker and Docker Compose (for containerized deployment)
 
 ### Install YARA (Linux/macOS)
 ```bash
@@ -56,9 +57,23 @@ sudo make install
 ```
 
 ### Install YaraMan
+
+#### Option 1: Docker (Recommended)
 ```bash
 # Clone the repository
-git clone <repository-url>
+git clone https://github.com/aancw/yaraman
+cd yaraman
+
+# Build and run with Docker Compose
+docker-compose up -d
+
+# Access the application at http://localhost:5002
+```
+
+#### Option 2: Manual Installation
+```bash
+# Clone the repository
+git clone https://github.com/aancw/yaraman
 cd yaraman
 
 # Install Python dependencies
@@ -66,6 +81,39 @@ pip install -r requirements.txt
 
 # Run the application
 python app.py
+```
+
+### Docker Configuration
+
+The Docker setup includes:
+- **Persistent volumes** for YARA rules, uploads, and database
+- **Health checks** for container monitoring
+- **Non-root user** execution for security
+- **Custom configuration** mounting support
+
+#### Docker Commands
+```bash
+# Start the application
+docker-compose up -d
+
+# View logs
+docker-compose logs -f yaraman
+
+# Stop the application
+docker-compose down
+
+# Rebuild after changes
+docker-compose build --no-cache
+docker-compose up -d
+```
+
+#### Volume Management
+```bash
+# Backup YARA rules
+docker run --rm -v yaraman_yaraman_rules:/data -v $(pwd):/backup alpine tar czf /backup/yara_rules_backup.tar.gz -C /data .
+
+# Restore YARA rules
+docker run --rm -v yaraman_yaraman_rules:/data -v $(pwd):/backup alpine tar xzf /backup/yara_rules_backup.tar.gz -C /data
 ```
 
 ## Usage
